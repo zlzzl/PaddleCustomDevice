@@ -18,6 +18,12 @@
 namespace custom_kernel {
 
 template <typename T, typename Context>
+void MultiplyKernel(const Context& dev_ctx,
+                    const phi::DenseTensor& x,
+                    const phi::DenseTensor& y,
+                    phi::DenseTensor* out);
+
+template <typename T, typename Context>
 void MeanRawKernel(const Context& dev_ctx,
                    const phi::DenseTensor& x,
                    const phi::IntArray& axes,
@@ -63,13 +69,13 @@ void MeanKernel(const Context& dev_ctx,
 }
 
 template <typename T, typename Context>
-void MeanGradKernel(const Context& dev_ctx,
-                    const phi::DenseTensor& x,
-                    const phi::DenseTensor& out_grad,
-                    const phi::IntArray& axes,
-                    bool keep_dim,
-                    bool reduce_all,
-                    phi::DenseTensor* x_grad) {
+void AclopMeanGradKernel(const Context& dev_ctx,
+                         const phi::DenseTensor& x,
+                         const phi::DenseTensor& out_grad,
+                         const phi::IntArray& axes,
+                         bool keep_dim,
+                         bool reduce_all,
+                         phi::DenseTensor* x_grad) {
   aclrtStream stream = static_cast<aclrtStream>(dev_ctx.stream());
   auto reduce_dims = axes.GetData();
   dev_ctx.template Alloc<T>(x_grad);
@@ -136,6 +142,66 @@ void MeanGradKernel(const Context& dev_ctx,
   const auto& runner2 = NpuOpRunner(
       "Mul", {transformed_x_grad, transformed_out_grad}, {*x_grad}, {});
   runner2.Run(stream);
+}
+
+template <typename T, typename Context>
+void MeanGradKernel(const Context& dev_ctx,
+                    const phi::DenseTensor& x,
+                    const phi::DenseTensor& out_grad,
+                    const phi::IntArray& axes,
+                    bool keep_dim,
+                    bool reduce_all,
+                    phi::DenseTensor* x_grad) {
+  aclrtStream stream = static_cast<aclrtStream>(dev_ctx.stream());
+  auto reduce_dims = axes.GetData();
+  dev_ctx.template Alloc<T>(x_grad);
+  if (x.dims().size() == 0) {
+    TensorCopy(dev_ctx, out_grad, true, x_grad);
+    return;
+  }
+
+  int reduce_numel = 1;
+
+  auto input_dims = x.dims();
+
+  if (reduce_all || reduce_dims.size() == 0) {
+    reduce_dims.clear();
+    for (int d = 0; d < input_dims.size(); ++d) {
+      reduce_dims.push_back(static_cast<int>(d));
+    }
+  }
+  for (auto& d : reduce_dims) {
+    if (d < 0) {
+      d = d + input_dims.size();
+    }
+    reduce_numel *= input_dims[d];
+  }
+
+  phi::DenseTensor base_grad;
+  phi::DenseTensorMeta base_grad_meta = {x.dtype(), {x.numel()}};
+  base_grad.set_meta(base_grad_meta);
+  FillNpuTensorWithConstant<T>(
+      &base_grad,
+      dev_ctx,
+      static_cast<T>(static_cast<T>(1.0f) / static_cast<T>(reduce_numel)));
+  base_grad.Resize(x.dims());
+
+  phi::DenseTensor transformed_x_grad, transformed_out_grad;
+  phi::DenseTensor tmp_out_grad;
+  auto tmp_output_dims = input_dims;
+  for (auto d : reduce_dims) {
+    tmp_output_dims[d] = 1;
+  }
+  tmp_out_grad = out_grad;
+  tmp_out_grad.ResizeAndAllocate(tmp_output_dims);
+  NpuElementWiseOpBroadcast<T>(dev_ctx,
+                               &base_grad,
+                               &tmp_out_grad,
+                               0,
+                               &transformed_x_grad,
+                               &transformed_out_grad);
+  custom_kernel::MultiplyKernel<T, Context>(
+      dev_ctx, transformed_x_grad, transformed_out_grad, x_grad);
 }
 
 }  // namespace custom_kernel
